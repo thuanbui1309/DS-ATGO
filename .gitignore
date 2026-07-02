@@ -1,0 +1,14 @@
+paper
+plans
+
+# experiment outputs & data (never commit)
+runs/
+data/
+*.pth
+*.pt
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
