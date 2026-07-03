@@ -2,7 +2,9 @@ import os
 import sys
 import time
 import json
+import random
 import tqdm
+import numpy as np
 import torch.utils.data
 from datetime import datetime
 
@@ -16,9 +18,40 @@ from network_model import ResNet19
 from run_utils import RunLogger, aggregate_exp, git_commit_hash
 
 
+def _rng_state():
+    """Snapshot every RNG stream setup_seed() touches, so a resumed run continues the
+    same trajectory (cudnn is deterministic here -> faithful within seed-noise)."""
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng(s):
+    random.setstate(s['python'])
+    np.random.set_state(s['numpy'])
+    torch.set_rng_state(s['torch'])
+    if torch.cuda.is_available() and s.get('cuda') is not None:
+        torch.cuda.set_rng_state_all(s['cuda'])
+
+
+def _save_ckpt(path, seed, epoch, best_acc, best_epoch, model, optimizer, scheduler, elapsed):
+    """Atomic full-state checkpoint (tmp + os.replace) -> ckpt_last.pth is never half-written."""
+    payload = {'seed': seed, 'epoch': epoch, 'best_acc': best_acc, 'best_epoch': best_epoch,
+               'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+               'scheduler': scheduler.state_dict(), 'rng': _rng_state(),
+               'elapsed': elapsed, 'git_commit': git_commit_hash()}
+    tmp = path + '.tmp'
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
 def train_one_run(seed, run_dir):
     """One full training run for a single seed. Training dynamics identical to the
-    original DS-ATGO main loop; only logging / checkpointing is added around it."""
+    original DS-ATGO main loop; only logging / checkpointing is added around it.
+    On restart, auto-resumes from ckpt_last.pth (full model+optim+sched+RNG state)."""
     setup_seed(seed)
     snn = ResNet19.ResNet19(args.T, args.output_size)
     snn.to(device)
@@ -29,11 +62,28 @@ def train_one_run(seed, run_dir):
     train_loader, test_loader = loader.DataLoader(
         args.data_type, args.data_set, args.batch_size, args.data_augment, args.num_workers)
 
-    logger = RunLogger(run_dir)
     num_epoch = args.smoke_epochs if args.smoke_epochs > 0 else args.num_epoch
-    start_time = time.time()
-    best_acc, best_epoch, test_acc = 0., 0, 0.
-    for epoch in range(num_epoch):
+    ckpt_path = os.path.join(run_dir, 'ckpt_last.pth')
+    start_epoch, best_acc, best_epoch, test_acc, resumed_elapsed = 0, 0., 0, 0., 0.
+    resuming = args.resume and args.smoke_epochs == 0 and os.path.exists(ckpt_path)
+    if resuming:
+        # weights_only=False: our own trusted ckpt carries numpy/python RNG state, which
+        # the torch>=2.6 default (weights_only=True) would refuse to unpickle.
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        snn.load_state_dict(ck['model'])
+        optimizer.load_state_dict(ck['optimizer'])
+        scheduler.load_state_dict(ck['scheduler'])
+        _restore_rng(ck['rng'])
+        start_epoch, best_acc, best_epoch = ck['epoch'], ck['best_acc'], ck['best_epoch']
+        resumed_elapsed = ck.get('elapsed', 0.)
+        print('[resume] seed %d <- %s @ epoch %d (best %.2f@%d)'
+              % (seed, ckpt_path, start_epoch, best_acc, best_epoch))
+
+    logger = RunLogger(run_dir, resume=resuming)
+    if resuming:
+        logger.reconcile_to_epoch(start_epoch)
+    start_time = time.time() - resumed_elapsed
+    for epoch in range(start_epoch, num_epoch):
         epoch_start = time.time()
         lr = optimizer.param_groups[0]['lr']
         snn.train()
@@ -87,6 +137,12 @@ def train_one_run(seed, run_dir):
             'best_acc': round(best_acc, 4), 'best_epoch': best_epoch, 'lr': lr,
             'epoch_time_s': round(epoch_time, 2), 'timestamp': tp})
 
+        # full-state resumable checkpoint (written AFTER the csv row; reconcile_to_epoch
+        # on resume drops any row past the checkpoint, so a crash never desyncs the two)
+        if args.smoke_epochs == 0 and (epoch + 1) % max(args.ckpt_every, 1) == 0:
+            _save_ckpt(ckpt_path, seed, epoch + 1, best_acc, best_epoch,
+                       snn, optimizer, scheduler, elapsed)
+
     total_time = time.time() - start_time
     summary = {
         'seed': seed, 'data_type': args.data_type, 'T': args.T, 'network': args.network_type,
@@ -95,10 +151,12 @@ def train_one_run(seed, run_dir):
         'final_test_acc': round(test_acc, 4),
         'total_time_s': round(total_time, 1),
         'mean_epoch_time_s': round(total_time / max(num_epoch, 1), 2),
-        'git_commit': git_commit_hash(), 'completed': True,
+        'git_commit': git_commit_hash(), 'completed': True, 'resumed': resuming,
         'config': {k: getattr(args, k) for k in vars(args)},
     }
     logger.write_summary(summary)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)   # run complete -> best.pth stays, drop the resume checkpoint
     return summary
 
 

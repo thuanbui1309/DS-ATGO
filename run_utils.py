@@ -27,12 +27,27 @@ class RunLogger:
     FIELDS = ['epoch', 'train_loss', 'train_acc', 'test_loss', 'test_acc',
               'best_acc', 'best_epoch', 'lr', 'epoch_time_s', 'timestamp']
 
-    def __init__(self, run_dir):
+    def __init__(self, run_dir, resume=False):
         self.run_dir = run_dir
         os.makedirs(run_dir, exist_ok=True)
         self.csv_path = os.path.join(run_dir, 'metrics.csv')
+        if resume and os.path.exists(self.csv_path):
+            return   # keep existing rows; reconcile_to_epoch() trims any past the checkpoint
         with open(self.csv_path, 'w', newline='') as f:
             csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+
+    def reconcile_to_epoch(self, epoch):
+        """Drop metrics rows beyond `epoch` so the CSV matches the resumed checkpoint state
+        (a row may have been written after the last checkpoint but before the crash)."""
+        rows = []
+        if os.path.exists(self.csv_path):
+            with open(self.csv_path, newline='') as f:
+                rows = [r for r in csv.DictReader(f) if r.get('epoch') and int(r['epoch']) <= epoch]
+        with open(self.csv_path, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=self.FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, '') for k in self.FIELDS})
 
     def log_epoch(self, row):
         with open(self.csv_path, 'a', newline='') as f:

@@ -37,4 +37,10 @@ parser.add_argument("--aggregate", action='store_true', default=False,
                     help='only aggregate existing seed summaries in the exp dir, no training')
 parser.add_argument("--smoke_epochs", type=int, default=0,
                     help='if >0, override num_epoch for a quick smoke test (writes to <exp>_smoke<N>)')
+parser.add_argument("--resume", action='store_true', default=True,
+                    help='auto-resume from last full-state checkpoint (ckpt_last.pth) if present (default: on)')
+parser.add_argument("--no_resume", dest='resume', action='store_false',
+                    help='ignore any ckpt_last.pth and train from scratch')
+parser.add_argument("--ckpt_every", type=int, default=1,
+                    help='write a full-state resumable checkpoint every N epochs (default: 1)')
 args = parser.parse_known_args()[0]
